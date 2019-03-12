@@ -5,68 +5,45 @@ import math
 import numpy as np
 
 import torch
+import torch.nn as nn
 import torch.legacy.optim as legacyOptim
 
 import torch.nn.functional as F
 import torch.multiprocessing as mp
-from torch.autograd import Variable
+from torchvision import datasets, transforms
 
-from envs import create_atari_env
 from model import ES
 
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
 
 
-def do_rollouts(args, models, random_seeds, return_queue, env, are_negative):
+def do_rollouts(args, models, random_seeds, return_queue, data, label, are_negative):
     """
     For each model, do a rollout. Supports multiple models per thread but
     don't do it -- it's inefficient (it's mostly a relic of when I would run
     both a perturbation and its antithesis on the same thread).
     """
     all_returns = []
-    all_num_frames = []
+    all_acc = []
     for model in models:
-        if not args.small_net:
-            cx = Variable(torch.zeros(1, 256))
-            hx = Variable(torch.zeros(1, 256))
-        state = env.reset()
-        state = torch.from_numpy(state)
-        this_model_return = 0
-        this_model_num_frames = 0
         # Rollout
-        for step in range(args.max_episode_length):
-            if args.small_net:
-                state = state.float()
-                state = state.view(1, env.observation_space.shape[0])
-                logit = model(Variable(state, volatile=True))
-            else:
-                logit, (hx, cx) = model(
-                    (Variable(state.unsqueeze(0), volatile=True),
-                     (hx, cx)))
-
-            prob = F.softmax(logit)
-            action = prob.max(1)[1].data.numpy()
-            state, reward, done, _ = env.step(action[0])
-            this_model_return += reward
-            this_model_num_frames += 1
-            if done:
-                break
-            state = torch.from_numpy(state)
-        all_returns.append(this_model_return)
-        all_num_frames.append(this_model_num_frames)
-    return_queue.put((random_seeds, all_returns, all_num_frames, are_negative))
+        logit = model(data)
+        with torch.no_grad():
+            reward = -F.cross_entropy(logit, label).numpy()
+            _, preds = torch.max(logit, 1)
+            all_acc.append(torch.sum(preds == label.data).numpy() / len(label))
+        all_returns.append(reward)
+    return_queue.put((random_seeds, all_returns, all_acc, are_negative))
 
 
-def perturb_model(args, model, random_seed, env):
+def perturb_model(args, model, random_seed):
     """
     Modifies the given model with a pertubation of its parameters,
     as well as the negative perturbation, and returns both perturbed
     models.
     """
-    new_model = ES(env.observation_space.shape[0],
-                   env.action_space, args.small_net)
-    anti_model = ES(env.observation_space.shape[0],
-                    env.action_space, args.small_net)
+    new_model = ES(args.small_net)
+    anti_model = ES(args.small_net)
     new_model.load_state_dict(model.state_dict())
     anti_model.load_state_dict(model.state_dict())
     np.random.seed(random_seed)
@@ -83,8 +60,8 @@ maxReward = []
 minReward = []
 episodeCounter = []
 
-def gradient_update(args, synced_model, returns, random_seeds, neg_list,
-                    num_eps, num_frames, chkpt_dir, unperturbed_results):
+def gradient_update(args, synced_model, returns, accs, random_seeds, neg_list,
+                    num_eps, chkpt_dir, unperturbed_results):
     def fitness_shaping(returns):
         """
         A rank transformation on the rewards, which reduces the chances
@@ -121,19 +98,19 @@ def gradient_update(args, synced_model, returns, random_seeds, neg_list,
         print('Episode num: %d\n'
               'Average reward: %f\n'
               'Variance in rewards: %f\n'
+              'Max accuracy: %f\n'
               'Max reward: %f\n'
               'Min reward: %f\n'
               'Batch size: %d\n'
               'Max episode length: %d\n'
               'Sigma: %f\n'
               'Learning rate: %f\n'
-              'Total num frames seen: %d\n'
               'Unperturbed reward: %f\n'
               'Unperturbed rank: %s\n' 
-              'Using Adam: %r\n\n' %
-              (num_eps, np.mean(returns), np.var(returns), max(returns),
+              'Using Adam: %r\n' %
+              (num_eps, np.mean(returns), np.var(returns), max(accs), max(returns),
                min(returns), batch_size,
-               args.max_episode_length, args.sigma, args.lr, num_frames,
+               args.max_episode_length, args.sigma, args.lr,
                unperturbed_results, rank_diag, args.useAdam))
 
     averageReward.append(np.mean(returns))
@@ -141,18 +118,18 @@ def gradient_update(args, synced_model, returns, random_seeds, neg_list,
     maxReward.append(max(returns))
     minReward.append(min(returns))
 
-    pltAvg, = plt.plot(episodeCounter, averageReward, label='average')
-    pltMax, = plt.plot(episodeCounter, maxReward,  label='max')
-    pltMin, = plt.plot(episodeCounter, minReward,  label='min')
+#    pltAvg, = plt.plot(episodeCounter, averageReward, label='average')
+#    pltMax, = plt.plot(episodeCounter, maxReward,  label='max')
+#    pltMin, = plt.plot(episodeCounter, minReward,  label='min')
 
-    plt.ylabel('rewards')
-    plt.xlabel('episode num')
-    plt.legend(handles=[pltAvg, pltMax,pltMin])
+#    plt.ylabel('rewards')
+#    plt.xlabel('episode num')
+#    plt.legend(handles=[pltAvg, pltMax,pltMin])
 
-    fig1 = plt.gcf()
+#    fig1 = plt.gcf()
 
-    plt.draw()
-    fig1.savefig('graph.png', dpi=100)
+#    plt.draw()
+#    fig1.savefig('graph.png', dpi=100)
 
     # For each model, generate the same random numbers as we did
     # before, and update parameters. We apply weight decay once.
@@ -204,105 +181,105 @@ def gradient_update(args, synced_model, returns, random_seeds, neg_list,
     return synced_model
 
 
-def render_env(args, model, env):
-    while True:
-        state = env.reset()
-        state = torch.from_numpy(state)
-        this_model_return = 0
-        if not args.small_net:
-            cx = Variable(torch.zeros(1, 256))
-            hx = Variable(torch.zeros(1, 256))
-        done = False
-        while not done:
-            if args.small_net:
-                state = state.float()
-                state = state.view(1, env.observation_space.shape[0])
-                logit = model(Variable(state, volatile=True))
-            else:
-                logit, (hx, cx) = model(
-                    (Variable(state.unsqueeze(0), volatile=True),
-                     (hx, cx)))
+def render_env(args, model):
+    return
 
-            prob = F.softmax(logit)
-            action = prob.max(1)[1].data.numpy()
-            state, reward, done, _ = env.step(action[0, 0])
-            env.render()
-            this_model_return += reward
-            state = torch.from_numpy(state)
-        print('Reward: %f' % this_model_return)
-
-
-def generate_seeds_and_models(args, synced_model, env):
+def generate_seeds_and_models(args, synced_model):
     """
     Returns a seed and 2 perturbed models
     """
     np.random.seed()
     random_seed = np.random.randint(2**30)
-    two_models = perturb_model(args, synced_model, random_seed, env)
+    two_models = perturb_model(args, synced_model, random_seed)
     return random_seed, two_models
 
 
-def train_loop(args, synced_model, env, chkpt_dir):
+def train_loop(args, synced_model, chkpt_dir):
     def flatten(raw_results, index):
         notflat_results = [result[index] for result in raw_results]
         return [item for sublist in notflat_results for item in sublist]
     print("Num params in network %d" % synced_model.count_parameters())
     num_eps = 0
     total_num_frames = 0
+
+    transform = transforms.Compose([transforms.ToTensor(),
+                               transforms.Normalize((0.1307,), (0.3081,))])
+    data_train = datasets.MNIST(root = "./data/",
+                            transform=transform,
+                            train = True)
+    data_test = datasets.MNIST(root="./data/",
+                           transform = transform,
+                           train = False)
+    dataloaders = {"train": torch.utils.data.DataLoader(dataset=data_train,
+                                                batch_size = 64,
+                                                shuffle = True),
+                   "test": torch.utils.data.DataLoader(dataset=data_test,
+                                               batch_size = 64,
+                                               shuffle = True)}
+    steps = 0
     for _ in range(args.max_gradient_updates):
-        processes = []
-        return_queue = mp.Queue()
-        all_seeds, all_models = [], []
-        # Generate a perturbation and its antithesis
-        for j in range(int(args.n/2)):
-            random_seed, two_models = generate_seeds_and_models(args,
-                                                                synced_model,
-                                                                env)
+        for data, label in dataloaders["train"]:
+            processes = []
+            return_queue = mp.Queue()
+            all_seeds, all_models = [], []
+            # Generate a perturbation and its antithesis
+            for j in range(int(args.n/2)):
+                random_seed, two_models = generate_seeds_and_models(args,
+                                                                synced_model)
             # Add twice because we get two models with the same seed
-            all_seeds.append(random_seed)
-            all_seeds.append(random_seed)
-            all_models += two_models
-        assert len(all_seeds) == len(all_models)
+                all_seeds.append(random_seed)
+                all_seeds.append(random_seed)
+                all_models += two_models
+            assert len(all_seeds) == len(all_models)
         # Keep track of which perturbations were positive and negative
         # Start with negative true because pop() makes us go backwards
-        is_negative = True
+            is_negative = True
         # Add all peturbed models to the queue
-        while all_models:
-            perturbed_model = all_models.pop()
-            seed = all_seeds.pop()
-            p = mp.Process(target=do_rollouts, args=(args,
+            while all_models:
+                perturbed_model = all_models.pop()
+                seed = all_seeds.pop()
+                p = mp.Process(target=do_rollouts, args=(args,
                                                      [perturbed_model],
                                                      [seed],
                                                      return_queue,
-                                                     env,
+                                                     data,
+                                                     label,
                                                      [is_negative]))
+                p.start()
+                processes.append(p)
+                is_negative = not is_negative
+            assert len(all_seeds) == 0
+        # Evaluate the unperturbed model as well
+            p = mp.Process(target=do_rollouts, args=(args, [synced_model],
+                                                 ['dummy_seed'],
+                                                 return_queue, data, label,
+                                                 ['dummy_neg']))
             p.start()
             processes.append(p)
-            is_negative = not is_negative
-        assert len(all_seeds) == 0
-        # Evaluate the unperturbed model as well
-        p = mp.Process(target=do_rollouts, args=(args, [synced_model],
-                                                 ['dummy_seed'],
-                                                 return_queue, env,
-                                                 ['dummy_neg']))
-        p.start()
-        processes.append(p)
-        for p in processes:
-            p.join()
-        raw_results = [return_queue.get() for p in processes]
-        seeds, results, num_frames, neg_list = [flatten(raw_results, index)
+            for p in processes:
+                p.join()
+            raw_results = [return_queue.get() for p in processes]
+            seeds, results, accs, neg_list = [flatten(raw_results, index)
                                                 for index in [0, 1, 2, 3]]
         # Separate the unperturbed results from the perturbed results
-        _ = unperturbed_index = seeds.index('dummy_seed')
-        seeds.pop(unperturbed_index)
-        unperturbed_results = results.pop(unperturbed_index)
-        _ = num_frames.pop(unperturbed_index)
-        _ = neg_list.pop(unperturbed_index)
+            _ = unperturbed_index = seeds.index('dummy_seed')
+            seeds.pop(unperturbed_index)
+            unperturbed_results = results.pop(unperturbed_index)
+            _ = neg_list.pop(unperturbed_index)
 
-        total_num_frames += sum(num_frames)
-        num_eps += len(results)
-        synced_model = gradient_update(args, synced_model, results, seeds,
-                                       neg_list, num_eps, total_num_frames,
+            num_eps += len(results)
+            synced_model = gradient_update(args, synced_model, results, accs, seeds,
+                                       neg_list, num_eps, 
                                        chkpt_dir, unperturbed_results)
-        if args.variable_ep_len:
-            args.max_episode_length = int(2*sum(num_frames)/len(num_frames))
+#            steps += 1
+#            if steps % 10 == 0:
+#                running_corrects = 0
+#                synced_model.eval()
+#                for inputs, labels in dataloaders["test"]:
+#                    with torch.no_grad():
+#                    outputs = synced_model(inputs)
+#                    _, preds = torch.max(outputs, 1)
+#                    running_corrects += torch.sum(preds == labels.data)
+#                epoch_acc = running_corrects.double() / len(data_test)
+#                print('Step {} Acc: {:.4f}'.format(steps, epoch_acc))
+#                synced_model.train()
